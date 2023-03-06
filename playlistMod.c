@@ -61,6 +61,8 @@ typedef struct {
 
     bool ctl_request_exit; // can be set to true if the worker should exit
     bool ctl_pause; // can be set to true if the worker should pause
+    bool ctl_request_skip; // can be set to true if the worker should skip the current file
+    bool ctl_request_prev; // can be set to true if the worker should go to the previous file
 
     bool is_running; // indicates if the worker is running
 } PlaylistWorker;
@@ -185,6 +187,18 @@ static int playlist_worker_process(
             status = 1;
             break;
         }
+        if (worker->ctl_request_skip){
+            worker->ctl_request_skip = false;
+            FURI_LOG_D(TAG, "    (TX) Requested to skip. Cancelling and resending...");
+            status = 0;
+            break;
+        }
+        if (worker->ctl_request_prev){
+            worker->ctl_request_prev = false;
+            FURI_LOG_D(TAG, "    (TX) Requested to prev. Cancelling and resending...");
+            status = 3;
+            break;
+        }
         furi_delay_ms(50);
     }
 
@@ -213,19 +227,29 @@ static bool playlist_worker_wait_pause(PlaylistWorker* worker) {
     return true;
 }
 
-static bool playlist_worker_play_playlist_once(
-    PlaylistWorker* worker,
-    Storage* storage,
-    FlipperFormat* fff_head,
-    FlipperFormat* fff_data,
-    FuriString* data,
-    FuriString* preset,
-    FuriString* protocol) {
+void updatePlayListView(PlaylistWorker* worker, const char* str) {
+    furi_string_reset(worker->meta->prev_3_path);
+    furi_string_set(worker->meta->prev_3_path, furi_string_get_cstr(worker->meta->prev_2_path));
+
+    furi_string_reset(worker->meta->prev_2_path);
+    furi_string_set(worker->meta->prev_2_path, furi_string_get_cstr(worker->meta->prev_1_path));
+
+    furi_string_reset(worker->meta->prev_1_path);
+    furi_string_set(worker->meta->prev_1_path, furi_string_get_cstr(worker->meta->prev_0_path));
+
+    furi_string_reset(worker->meta->prev_0_path);
+    furi_string_set(worker->meta->prev_0_path, str);
+
+    view_port_update(worker->meta->view_port);
+}
+
+static bool playlist_worker_play_playlist_once(PlaylistWorker* worker, Storage* storage, FlipperFormat* fff_head, FlipperFormat* fff_data, FuriString* data, FuriString* preset, FuriString* protocol) {
     //
     if(!flipper_format_rewind(fff_head)) {
         FURI_LOG_E(TAG, "Failed to rewind file");
         return false;
     }
+
     while(flipper_format_read_string(fff_head, "sub", data)) {
         if(!playlist_worker_wait_pause(worker)) {
             break;
@@ -238,19 +262,7 @@ static bool playlist_worker_play_playlist_once(
         const char* str = furi_string_get_cstr(data);
 
         // it's not fancy, but it works for now :)
-        furi_string_reset(worker->meta->prev_3_path);
-        furi_string_set(worker->meta->prev_3_path, furi_string_get_cstr(worker->meta->prev_2_path));
-
-        furi_string_reset(worker->meta->prev_2_path);
-        furi_string_set(worker->meta->prev_2_path, furi_string_get_cstr(worker->meta->prev_1_path));
-
-        furi_string_reset(worker->meta->prev_1_path);
-        furi_string_set(worker->meta->prev_1_path, furi_string_get_cstr(worker->meta->prev_0_path));
-
-        furi_string_reset(worker->meta->prev_0_path);
-        furi_string_set(worker->meta->prev_0_path, str);
-
-        view_port_update(worker->meta->view_port);
+        updatePlayListView(worker, str);
 
         for(int i = 0; i < 1; i++) {
             if(!playlist_worker_wait_pause(worker)) {
@@ -263,8 +275,7 @@ static bool playlist_worker_play_playlist_once(
 
             FlipperFormat* fff_file = flipper_format_file_alloc(storage);
 
-            int status =
-                playlist_worker_process(worker, fff_file, fff_data, str, preset, protocol);
+            int status = playlist_worker_process(worker, fff_file, fff_data, str, preset, protocol);
 
             // if there was an error, fff_file is not already freed
             if(status < 0) {
@@ -280,6 +291,24 @@ static bool playlist_worker_play_playlist_once(
                 // exited, exit loop
             } else if(status == 2) {
                 return false;
+            }
+            else if(status == 3){
+                //aqui rebobinamos y avanzamos de nuevo el fichero n-1 veces
+                //decrementamos el contador de ficheros enviados
+                worker->meta->current_count--;
+                if (worker->meta->current_count > 0){
+                    worker->meta->current_count--;
+                }
+                //rebobinamos el fichero
+                if(!flipper_format_rewind(fff_head)) {
+                    FURI_LOG_E(TAG, "Failed to rewind file");
+                    return false;
+                }
+                //avanzamos el fichero n-1 veces
+                for(int j = 0; j < worker->meta->current_count; j++){
+                    flipper_format_read_string(fff_head, "sub", data);                    
+                }
+                break;
             }
         }
     } // end of loop
@@ -329,8 +358,7 @@ static int32_t playlist_worker_thread(void* ctx) {
             worker->meta->current_playlist_repetition,
             worker->meta->playlist_repetitions);
 
-        if(!playlist_worker_play_playlist_once(
-               worker, storage, fff_head, fff_data, data, preset, protocol)) {
+        if(!playlist_worker_play_playlist_once( worker, storage, fff_head, fff_data, data, preset, protocol)) {
             break;
         }
     }
@@ -712,12 +740,21 @@ int32_t playlist_app(void* p) {
                     --app->meta->playlist_repetitions;
                 }
             }
+            else if(app->meta->state == STATE_SENDING) {
+                if(input.type == InputTypeShort) {
+                    app->worker->ctl_request_prev = true;
+                }
+            }
             break;
 
         case InputKeyRight:
             if(app->meta->state == STATE_OVERVIEW) {
                 if(input.type == InputTypeShort) {
                     ++app->meta->playlist_repetitions;
+                }
+            } else if(app->meta->state == STATE_SENDING) {
+                if(input.type == InputTypeShort) {
+                    app->worker->ctl_request_skip = true;
                 }
             }
             break;
